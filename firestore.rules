@@ -1,0 +1,146 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required)
+    //   - displayName: string (required)
+    //   - email: string (required)
+    //   - role: string (required, 'student', 'teacher', 'manager')
+    //   - subjects: list of strings (optional)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: requests
+    // Document ID: {requestId}
+    // Fields:
+    //   - studentId: string (required)
+    //   - studentName: string (required)
+    //   - teacherId: string (required)
+    //   - teacherName: string (required)
+    //   - subject: string (required)
+    //   - date: string (required, YYYY-MM-DD)
+    //   - startTime: string (required, HH:mm)
+    //   - endTime: string (required, HH:mm)
+    //   - status: string (required, 'pending_teacher', 'pending_manager', 'approved', 'rejected')
+    //   - roomId: string (required, 'room1', 'room2', '')
+    //   - createdAt: timestamp (required)
+    //   - updatedAt: timestamp (required)
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function isManager() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'manager') || 
+        (request.auth.token.email == "n42845054@gmail.com" && request.auth.token.email_verified == true)
+      );
+    }
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'displayName', 'email', 'role', 'subjects', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 100 &&
+             data.displayName is string && data.displayName.size() > 0 && data.displayName.size() < 100 &&
+             isValidEmail(data.email) &&
+             data.role in ['student', 'teacher', 'manager'] &&
+             (!('subjects' in data) || (data.subjects is list && data.subjects.size() <= 20)) &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidRequest(data) {
+      return hasOnlyAllowedFields(['studentId', 'studentName', 'teacherId', 'teacherName', 'subject', 'date', 'startTime', 'endTime', 'status', 'roomId', 'createdAt', 'updatedAt']) &&
+             data.studentId is string && data.studentId.size() > 0 && data.studentId.size() < 100 &&
+             data.studentName is string && data.studentName.size() > 0 && data.studentName.size() < 100 &&
+             data.teacherId is string && data.teacherId.size() > 0 && data.teacherId.size() < 100 &&
+             data.teacherName is string && data.teacherName.size() > 0 && data.teacherName.size() < 100 &&
+             data.subject is string && data.subject.size() > 0 && data.subject.size() < 100 &&
+             data.date is string && data.date.size() == 10 &&
+             data.startTime is string && data.startTime.size() == 5 &&
+             data.endTime is string && data.endTime.size() == 5 &&
+             data.status in ['pending_teacher', 'pending_manager', 'approved', 'rejected'] &&
+             data.roomId is string && data.roomId in ['room1', 'room2', ''] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    match /users/{userId} {
+      // Anyone authenticated can read user profiles (needed to find teachers)
+      allow read: if isAuthenticated();
+      
+      // Users can create their own profile. Default admin is the specific email.
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && 
+                    (request.resource.data.role in ['student', 'teacher'] || 
+                     (request.resource.data.role == 'manager' && request.auth.token.email == "n42845054@gmail.com"));
+      
+      // Users can update their own profile, but cannot change their role unless they are an admin.
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && 
+                    (request.resource.data.role == resource.data.role || isManager()) &&
+                    request.resource.data.uid == resource.data.uid &&
+                    request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    match /requests/{requestId} {
+      // Students can read their own requests, Teachers can read requests assigned to them, Managers can read all
+      allow read: if isAuthenticated() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.teacherId == request.auth.uid ||
+        isManager()
+      );
+
+      // Students create requests
+      allow create: if isAuthenticated() && 
+                    isValidRequest(request.resource.data) &&
+                    request.resource.data.studentId == request.auth.uid &&
+                    request.resource.data.status == 'pending_teacher' &&
+                    request.resource.data.roomId == '';
+
+      // Updates depend on role and current status
+      allow update: if isAuthenticated() && isValidRequest(request.resource.data) &&
+                    request.resource.data.studentId == resource.data.studentId &&
+                    request.resource.data.teacherId == resource.data.teacherId &&
+                    request.resource.data.createdAt == resource.data.createdAt &&
+                    (
+                      // Student can cancel (reject) their own pending request
+                      (resource.data.studentId == request.auth.uid && 
+                       request.resource.data.status == 'rejected' &&
+                       request.resource.data.roomId == resource.data.roomId) ||
+                      
+                      // Teacher can approve (move to pending_manager) or reject
+                      (resource.data.teacherId == request.auth.uid && 
+                       resource.data.status == 'pending_teacher' &&
+                       request.resource.data.status in ['pending_manager', 'rejected'] &&
+                       request.resource.data.roomId == resource.data.roomId) ||
+                       
+                      // Manager can approve (assign room) or reject
+                      (isManager() && 
+                       resource.data.status == 'pending_manager' &&
+                       request.resource.data.status in ['approved', 'rejected'])
+                    );
+    }
+  }
+}
